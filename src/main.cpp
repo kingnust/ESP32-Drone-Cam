@@ -21,6 +21,12 @@ static constexpr uint32_t PREVIEW_INTERVAL_MS = 200;
 static constexpr uint32_t QR_FRAME_INTERVAL_MS = 250;
 static constexpr uint32_t SERIAL_HEARTBEAT_MS = 2000;
 static constexpr uint32_t FRAME_PROBE_INTERVAL_MS = 10000;
+static constexpr uint32_t FC_QUERY_INTERVAL_MS = 1000;
+static constexpr uint32_t FC_LINK_TIMEOUT_MS = 2500;
+static constexpr uint8_t MSP_API_VERSION = 1;
+static constexpr uint16_t MSP2_CAMERA_QR = 0x3001;
+static constexpr uint32_t QR_RETRY_INTERVAL_MS = 500;
+static constexpr size_t FC_QR_MAX_PAYLOAD = 96;
 
 ESP32QRCodeReader reader(CAMERA_MODEL_AI_THINKER);
 WebServer server(80);
@@ -28,6 +34,7 @@ WebServer server(80);
 portMUX_TYPE qrMux = portMUX_INITIALIZER_UNLOCKED;
 char lastQrPayload[512] = "";
 volatile uint32_t lastQrMs = 0;
+volatile uint32_t qrEventCount = 0;
 volatile uint32_t scanCount = 0;
 volatile uint32_t validCount = 0;
 volatile uint32_t candidateCount = 0;
@@ -38,6 +45,17 @@ volatile bool scannerReady = false;
 volatile int scannerSetupResult = SETUP_OK;
 volatile uint32_t previewFrameCount = 0;
 volatile uint32_t previewErrorCount = 0;
+volatile uint32_t fcRequestCount = 0;
+volatile uint32_t fcResponseCount = 0;
+volatile uint32_t fcChecksumErrorCount = 0;
+volatile uint32_t fcLastResponseMs = 0;
+volatile uint8_t fcApiProtocol = 0;
+volatile uint8_t fcApiMajor = 0;
+volatile uint8_t fcApiMinor = 0;
+volatile uint32_t qrUartSendCount = 0;
+volatile uint32_t qrUartAckCount = 0;
+volatile uint32_t qrUartRejectCount = 0;
+volatile bool qrUartPending = false;
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html>
@@ -71,7 +89,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
         const q = await r.json();
         document.getElementById('payload').textContent = q.payload || 'Waiting for QR...';
         document.getElementById('meta').textContent =
-          'fresh=' + q.fresh + ' age_ms=' + q.age_ms + ' scans=' + q.scans + ' candidates=' + q.candidates + ' decode_errors=' + q.decode_errors + ' mirrored=' + q.mirrored + ' valid=' + q.valid_scans + ' flash=' + q.flash;
+          'FC UART=' + (q.fc_connected ? 'connected' : 'waiting') + ' API=' + q.fc_api + ' requests=' + q.fc_requests + ' responses=' + q.fc_responses + ' crc_errors=' + q.fc_crc_errors + ' QR sent=' + q.qr_uart_sent + ' ack=' + q.qr_uart_acks + ' rejected=' + q.qr_uart_rejected + ' pending=' + q.qr_uart_pending + ' | fresh=' + q.fresh + ' age_ms=' + q.age_ms + ' scans=' + q.scans + ' candidates=' + q.candidates + ' decode_errors=' + q.decode_errors + ' mirrored=' + q.mirrored + ' valid=' + q.valid_scans + ' flash=' + q.flash;
       } catch (e) {
         document.getElementById('meta').textContent = 'Lost connection to ESP32-CAM';
       }
@@ -96,10 +114,12 @@ void copyPayload(const uint8_t* payload, size_t payloadLen)
   const size_t len = payloadLen > maxLen ? maxLen : payloadLen;
 
   portENTER_CRITICAL(&qrMux);
+  const bool changed = strlen(lastQrPayload) != len || memcmp(lastQrPayload, payload, len) != 0;
   memcpy(lastQrPayload, payload, len);
   lastQrPayload[len] = 0;
   lastQrMs = millis();
   validCount++;
+  if (changed) qrEventCount++;
   portEXIT_CRITICAL(&qrMux);
 }
 
@@ -122,6 +142,189 @@ void transposeQrCode(struct quirc_code& code)
   }
 }
 
+void sendFcApiRequest()
+{
+  static const uint8_t request[] = {'$', 'M', '<', 0, MSP_API_VERSION, MSP_API_VERSION};
+  Serial.write(request, sizeof(request));
+  Serial.flush();
+  fcRequestCount++;
+}
+
+uint8_t crc8DvbS2(uint8_t crc, uint8_t value)
+{
+  crc ^= value;
+  for (uint8_t i = 0; i < 8; i++)
+  {
+    crc = crc & 0x80 ? static_cast<uint8_t>((crc << 1) ^ 0xD5) : static_cast<uint8_t>(crc << 1);
+  }
+  return crc;
+}
+
+void sendMspV2(uint16_t command, const uint8_t* payload, uint16_t length)
+{
+  uint8_t header[] = {'$', 'X', '<', 0, static_cast<uint8_t>(command),
+                      static_cast<uint8_t>(command >> 8), static_cast<uint8_t>(length),
+                      static_cast<uint8_t>(length >> 8)};
+  uint8_t crc = 0;
+  for (size_t i = 3; i < sizeof(header); i++) crc = crc8DvbS2(crc, header[i]);
+  Serial.write(header, sizeof(header));
+  for (uint16_t i = 0; i < length; i++) crc = crc8DvbS2(crc, payload[i]);
+  Serial.write(payload, length);
+  Serial.write(crc);
+  Serial.flush();
+}
+
+void updateFcUart()
+{
+  enum ParseState : uint8_t {
+    SYNC_DOLLAR, SYNC_PROTOCOL, V1_DIRECTION, V1_SIZE, V1_COMMAND, V1_PAYLOAD, V1_CHECKSUM,
+    V2_DIRECTION, V2_HEADER, V2_PAYLOAD, V2_CHECKSUM
+  };
+  static ParseState state = SYNC_DOLLAR;
+  static uint16_t size = 0;
+  static uint16_t command = 0;
+  static uint8_t checksum = 0;
+  static uint16_t index = 0;
+  static uint8_t header[5];
+  static uint8_t payload[128];
+  static uint32_t lastQueryMs = 0;
+  static uint32_t lastQrSendMs = 0;
+  static uint32_t stagedEvent = 0;
+  static uint16_t pendingSequence = 0;
+  static uint8_t pendingPayload[5 + FC_QR_MAX_PAYLOAD];
+  static uint8_t pendingLength = 0;
+
+  const uint32_t now = millis();
+  if (now - lastQueryMs >= FC_QUERY_INTERVAL_MS)
+  {
+    lastQueryMs = now;
+    sendFcApiRequest();
+  }
+
+  if (!qrUartPending && stagedEvent != qrEventCount)
+  {
+    char qr[FC_QR_MAX_PAYLOAD + 1] = {};
+    uint32_t event;
+    portENTER_CRITICAL(&qrMux);
+    event = qrEventCount;
+    strncpy(qr, lastQrPayload, FC_QR_MAX_PAYLOAD);
+    portEXIT_CRITICAL(&qrMux);
+    const uint8_t length = static_cast<uint8_t>(strlen(qr));
+    if (length)
+    {
+      pendingSequence++;
+      pendingPayload[0] = 1;
+      pendingPayload[1] = 1;
+      pendingPayload[2] = static_cast<uint8_t>(pendingSequence);
+      pendingPayload[3] = static_cast<uint8_t>(pendingSequence >> 8);
+      pendingPayload[4] = length;
+      memcpy(&pendingPayload[5], qr, length);
+      pendingLength = 5 + length;
+      stagedEvent = event;
+      qrUartPending = true;
+      lastQrSendMs = 0;
+    }
+  }
+  if (qrUartPending && now - lastQrSendMs >= QR_RETRY_INTERVAL_MS)
+  {
+    lastQrSendMs = now;
+    sendMspV2(MSP2_CAMERA_QR, pendingPayload, pendingLength);
+    qrUartSendCount++;
+  }
+
+  while (Serial.available() > 0)
+  {
+    const uint8_t value = static_cast<uint8_t>(Serial.read());
+    switch (state)
+    {
+      case SYNC_DOLLAR: state = value == '$' ? SYNC_PROTOCOL : SYNC_DOLLAR; break;
+      case SYNC_PROTOCOL:
+        state = value == 'M' ? V1_DIRECTION : (value == 'X' ? V2_DIRECTION : SYNC_DOLLAR);
+        break;
+      case V1_DIRECTION: state = (value == '>' || value == '!') ? V1_SIZE : SYNC_DOLLAR; break;
+      case V1_SIZE:
+        size = value;
+        index = 0;
+        checksum = value;
+        state = size <= sizeof(payload) ? V1_COMMAND : SYNC_DOLLAR;
+        break;
+      case V1_COMMAND:
+        command = value;
+        checksum ^= value;
+        state = size ? V1_PAYLOAD : V1_CHECKSUM;
+        break;
+      case V1_PAYLOAD:
+        payload[index++] = value;
+        checksum ^= value;
+        if (index >= size) state = V1_CHECKSUM;
+        break;
+      case V1_CHECKSUM:
+        if (value == checksum)
+        {
+          if (command == MSP_API_VERSION && size >= 3)
+          {
+            fcApiProtocol = payload[0];
+            fcApiMajor = payload[1];
+            fcApiMinor = payload[2];
+            fcResponseCount++;
+            fcLastResponseMs = now;
+          }
+        }
+        else
+        {
+          fcChecksumErrorCount++;
+        }
+        state = SYNC_DOLLAR;
+        break;
+      case V2_DIRECTION:
+        index = 0;
+        checksum = 0;
+        state = (value == '>' || value == '!') ? V2_HEADER : SYNC_DOLLAR;
+        break;
+      case V2_HEADER:
+        header[index++] = value;
+        checksum = crc8DvbS2(checksum, value);
+        if (index == sizeof(header))
+        {
+          command = header[1] | (static_cast<uint16_t>(header[2]) << 8);
+          size = header[3] | (static_cast<uint16_t>(header[4]) << 8);
+          index = 0;
+          state = size <= sizeof(payload) ? (size ? V2_PAYLOAD : V2_CHECKSUM) : SYNC_DOLLAR;
+        }
+        break;
+      case V2_PAYLOAD:
+        payload[index++] = value;
+        checksum = crc8DvbS2(checksum, value);
+        if (index >= size) state = V2_CHECKSUM;
+        break;
+      case V2_CHECKSUM:
+        if (value == checksum)
+        {
+          if (command == MSP2_CAMERA_QR && size >= 4)
+          {
+            const uint16_t sequence = payload[2] | (static_cast<uint16_t>(payload[3]) << 8);
+            if (payload[0] == 1 && sequence == pendingSequence)
+            {
+              if (payload[1] == 0 || payload[1] == 1)
+              {
+                qrUartAckCount++;
+                qrUartPending = false;
+              }
+              else
+              {
+                qrUartRejectCount++;
+                qrUartPending = false;
+              }
+            }
+          }
+        }
+        else fcChecksumErrorCount++;
+        state = SYNC_DOLLAR;
+        break;
+    }
+  }
+}
+
 void qrTask(void* parameter)
 {
   struct quirc* decoder = quirc_new();
@@ -131,7 +334,6 @@ void qrTask(void* parameter)
   size_t rgbCapacity = 0;
   if (!decoder)
   {
-    Serial.println("QR decoder allocation failed");
     vTaskDelete(nullptr);
     return;
   }
@@ -140,7 +342,6 @@ void qrTask(void* parameter)
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb)
     {
-      Serial.println("QR camera capture failed");
       vTaskDelay(pdMS_TO_TICKS(QR_FRAME_INTERVAL_MS));
       continue;
     }
@@ -155,7 +356,6 @@ void qrTask(void* parameter)
     if (!rgb || !fmt2rgb888(fb->buf, fb->len, fb->format, rgb))
     {
       esp_camera_fb_return(fb);
-      Serial.println("QR JPEG decode failed");
       vTaskDelay(pdMS_TO_TICKS(QR_FRAME_INTERVAL_MS));
       continue;
     }
@@ -165,7 +365,6 @@ void qrTask(void* parameter)
       if (quirc_resize(decoder, fb->width, fb->height) < 0)
       {
         esp_camera_fb_return(fb);
-        Serial.println("QR resize failed");
         vTaskDelay(pdMS_TO_TICKS(QR_FRAME_INTERVAL_MS));
         continue;
       }
@@ -216,9 +415,6 @@ void qrTask(void* parameter)
       if (error == QUIRC_SUCCESS)
       {
         copyPayload(data.payload, data.payload_len);
-        Serial.print("QR: ");
-        Serial.write(data.payload, data.payload_len);
-        Serial.println();
       }
       else
       {
@@ -303,6 +499,27 @@ void handleQr()
   json += scannerReady ? "true" : "false";
   json += ",\"setup_result\":";
   json += scannerSetupResult;
+  json += ",\"fc_connected\":";
+  json += (fcLastResponseMs && now - fcLastResponseMs <= FC_LINK_TIMEOUT_MS) ? "true" : "false";
+  json += ",\"fc_requests\":";
+  json += fcRequestCount;
+  json += ",\"fc_responses\":";
+  json += fcResponseCount;
+  json += ",\"fc_crc_errors\":";
+  json += fcChecksumErrorCount;
+  json += ",\"fc_api\":\"";
+  json += fcApiMajor;
+  json += ".";
+  json += fcApiMinor;
+  json += "\"";
+  json += ",\"qr_uart_sent\":";
+  json += qrUartSendCount;
+  json += ",\"qr_uart_acks\":";
+  json += qrUartAckCount;
+  json += ",\"qr_uart_rejected\":";
+  json += qrUartRejectCount;
+  json += ",\"qr_uart_pending\":";
+  json += qrUartPending ? "true" : "false";
   json += "}";
 
   server.send(200, "application/json", json);
@@ -466,19 +683,6 @@ void setup()
 
 void loop()
 {
+  updateFcUart();
   server.handleClient();
-  static uint32_t lastHeartbeatMs = 0;
-  static uint32_t lastFrameProbeMs = 0;
-  const uint32_t now = millis();
-  if (now - lastHeartbeatMs >= SERIAL_HEARTBEAT_MS)
-  {
-    lastHeartbeatMs = now;
-    Serial.printf("CAM alive uptime=%lus clients=%u scans=%lu valid=%lu\r\n",
-                  now / 1000UL, WiFi.softAPgetStationNum(), scanCount, validCount);
-  }
-  if (now - lastFrameProbeMs >= FRAME_PROBE_INTERVAL_MS)
-  {
-    lastFrameProbeMs = now;
-    printCameraFrameProbe();
-  }
 }
